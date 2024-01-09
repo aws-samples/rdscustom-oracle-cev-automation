@@ -1,0 +1,465 @@
+
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: RDS Custom CEV Automation
+
+Parameters:
+
+  LatestAmiId:
+    Description: Image ID is from Parameter store of SSM. Leave it as-is.
+    Type:  "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+  S3Bucket:
+    Description: Enter the S3 bucket name to upload all the patches downloaded from Oracle Support.
+    Type: String
+  
+  S3bucketPrefix:
+    Description: Enter the S3 bucket Prefix for folder structure if not leave it blank.
+    Type: String
+
+  S3Prefix:
+    Description: Does S3 prefix present in the S3 bucket?
+    Type: String
+    Default: "No"
+    AllowedValues: ["Yes","No"]  
+
+  EC2SubnetID:
+    Description: Enter the Public Subnet ID for deploying EC2 Instance.
+    Type: AWS::EC2::Subnet::Id
+
+  EC2SecurityGroup:
+    Description: Enter the security group for EC2 Instance
+    Type: AWS::EC2::SecurityGroup::Id
+
+  DBVersion:
+    Description: Enter the DB version to download the patches and upload them to S3
+    Type: String
+    Default: "19.18"
+    AllowedValues:
+      - "19.17"
+      - "19.18"
+      - "19.19"
+      - "19.20"
+
+  OracleAccountUser:
+    Description: Enter the Oracle Account username to download the patches.
+    Type: String
+
+  OracleAccountPassword:
+    Description: Enter the Oracle Account Password to download the patches.
+    Type: String
+    NoEcho: True
+
+  KMSKeyID:
+    Description: Enter the KMS Key ID for the CEV creation
+    Type: String
+
+  EngineType:
+    Description: Enter the Engine type for CEV creation. Either "custom-oracle-ee" for Non-CDB or "custom-oracle-ee-cdb" for CDB. 
+    Type: String
+    Default: "custom-oracle-ee"
+    AllowedValues:
+      - custom-oracle-ee
+      - custom-oracle-ee-cdb
+
+  EngineVersion:
+    Description: Enter the Engine version name to be unique for every CEV. Names can include only lowercase letters (a-z), dashes(-), underscores (_), and periods (.) <Example - 19.cdb_cev1> 
+    Type: String
+    Default: 19.18-oracle-customer-cev
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "CEV Creation Requirements"
+        Parameters:
+          - S3Bucket
+          - S3Prefix
+          - S3bucketPrefix
+          - KMSKeyID
+          - EngineType
+          - EngineVersion
+      - Label:
+          default: "EC2 Network Configuration"
+        Parameters:
+          - LatestAmiId
+          - EC2SubnetID
+          - EC2SecurityGroup
+      - Label:
+          default: "Oracle DB Version"
+        Parameters:
+          - DBVersion
+      - Label:
+          default: "Oracle Support Login Details"
+        Parameters:
+          - OracleAccountUser
+          - OracleAccountPassword
+
+Conditions:
+  ShouldAddProperty: !Equals [!Ref S3Prefix, "Yes"]
+  CreateEngine1917: !Equals [!Ref DBVersion, "19.17"]
+  CreateEngine1918: !Equals [!Ref DBVersion, "19.18"]
+  CreateEngine1919: !Equals [!Ref DBVersion, "19.19"]
+  CreateEngine1920: !Equals [!Ref DBVersion, "19.20"]                                  
+
+Resources:
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: [profileClientIDE]
+    DeletionPolicy: Retain
+    Properties:
+      InstanceType: 't3.2xlarge'
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref profileClientIDE
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: '100'
+            DeleteOnTermination: 'false'
+            Encrypted: 'true'
+      Tags:
+        - Key: Name
+          Value: !Join ['-', ['RDS-Custom-CEV-Automation', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]],!Sub "${AWS::Region}"]] 
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet: 
+            - Ref: "EC2SecurityGroup"
+          SubnetId: 
+            Ref: EC2SubnetID 
+      UserData: 
+        Fn::Base64:
+          !Sub | 
+            #!/bin/bash
+            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+            LOGFILE="/home/ec2-user/bootstrap_$(date +'%Y-%m-%d').log"
+            echo "===========================================================================" >> $LOGFILE
+            echo "Validating the Bucket status"  >> $LOGFILE
+            bucketstatus=$(aws s3 ls ${S3Bucket} 2>&1)
+            if echo "$bucketstatus" | grep 'The specified bucket does not exist'; then
+              echo "$(date +\"%F\ %T\") * ${S3Bucket} bucket doesn't exist" >> $LOGFILE
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --region ${AWS::Region} --resource WaitCondition
+            elif [ -z "$bucketstatus" ]; then
+              echo "$(date +\"%F\ %T\") * ${S3Bucket} file doesn't exist in the S3 bucket" >> $LOGFILE
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --region ${AWS::Region} --resource WaitCondition
+            else
+              echo "$(date +\"%F\ %T\") * ${S3Bucket} Bucket owned and exists" >> $LOGFILE
+              echo "Installation of Packages for the Script to run sucessfully" >> $LOGFILE
+              sudo yum update -y
+              sudo yum update -y aws-cfn-bootstrap
+              #sudo yum -y --security update
+              echo "$(date \"+%F %T\") * running as $(whoami)" >> $LOGFILE
+              yum install -y unzip jq
+              sudo pip3 uninstall awscli -y
+              sudo rm -r /usr/bin/aws -f
+              echo " * installed supporting packages" >> $LOGFILE
+              mkdir /home/ec2-user/awscl
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/home/ec2-user/awscl/awscliv2.zip"
+              unzip "/home/ec2-user/awscl/awscliv2.zip" -d "/home/ec2-user/awscl"
+              sudo chown ec2-user:ec2-user /home/ec2-user/awscl/aws -R
+              sudo /home/ec2-user/awscl/aws/install -i /usr/local/aws-cli -b /usr/local/bin
+              echo "$(date \"+%F %T\") * installed awscli (v2)" >> $LOGFILE
+              sudo yum install git -y
+              git version >> $LOGFILE
+              sudo yum install python3 -y
+              python3 --version >> $LOGFILE
+              sudo yum install python3-pip -y
+              pip3 --version  >> $LOGFILE
+              sudo pip3 install selenium
+              sleep 50
+              sudo amazon-linux-extras install firefox -y
+              sleep 50
+              wget https://github.com/mozilla/geckodriver/releases/download/v0.34.0/geckodriver-v0.34.0-linux64.tar.gz -P /home/ec2-user
+              sudo tar -xzvf /home/ec2-user/geckodriver-v0.34.0-linux64.tar.gz -C /usr/local/bin
+              sudo chmod +x /usr/local/bin/geckodriver
+              export PATH=$PATH:/usr/local/bin/geckodriver
+              geckodriver -V >> $LOGFILE
+              sudo pip3 install webdrivermanager
+              sudo pip3 install urllib3==1.26.6
+              sudo mkdir -p /tmp/ssm
+              wget https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+              sudo systemctl enable amazon-ssm-agent  >> $LOGFILE
+              sudo systemctl start amazon-ssm-agent  >> $LOGFILE
+              sudo systemctl status amazon-ssm-agent
+              echo "=============================================================================" >> $LOGFILE
+              echo "Installation of packages completed" >> $LOGFILE
+              echo "=============================================================================" >> $LOGFILE
+              echo "Downloading Oracle Patches" >> $LOGFILE
+              echo "=============================================================================" >> $LOGFILE
+              mkdir -p /home/ec2-user/manifestfiles >> $LOGFILE
+              mkdir -p /home/ec2-user/downloaded_patches >> $LOGFILE
+              mkdir -p /home/ec2-user/regexpatchnames >> $LOGFILE
+              #wget  --secure-protocol=auto --save-cookies="/home/ec2-user/oraclecookies.txt" --keep-session-cookies  --http-user "${OracleAccountUser}" --http-password "${OracleAccountPassword}"  "https://updates.oracle.com/Orion/Services/download" -a /home/ec2-user/checkoracleloginvalidation.txt
+              wget  --secure-protocol=auto --http-user "${OracleAccountUser}" --http-password "${OracleAccountPassword}"  "https://updates.oracle.com/Orion/Services/download" -a /home/ec2-user/checkoracleloginvalidation.txt
+              loginfailed=`cat /home/ec2-user/checkoracleloginvalidation.txt | grep -i "Username/Password Authentication Failed" | wc -l`
+              if [ $loginfailed == 1 ]
+              then
+                echo "Oracle Support Username and Password is Wrong., Please submit the CFN again with right password." >> $LOGFILE
+                aws s3 cp $LOGFILE  s3://${S3Bucket}
+                /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --region ${AWS::Region} --resource WaitCondition
+              else
+                echo "Oracle Support login is successful with the provided Username and Password" >> $LOGFILE
+                curl "https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/samples/custom-oracle-manifest.zip" -o "/home/ec2-user/custom-oracle-manifest.zip"
+                unzip "/home/ec2-user/custom-oracle-manifest.zip" -d "/home/ec2-user/manifestfiles"
+                filename=`find /home/ec2-user -type f -name ${DBVersion}_manifest.json`
+                readme=`find /home/ec2-user -type f -name ${DBVersion}_readme`
+                cat $filename | grep -i zip | grep -o '".*"' | sed 's/"//g' > /home/ec2-user/regexpatchnames/${DBVersion}-patchnames.txt
+                Nofiles=`cat $filename | grep -i zip | grep -o '".*"' | sed 's/"//g' | wc -l`
+                echo $Nofiles
+                echo "Json file $filename"
+                binaries=(`jq '.[]' $filename | grep -i zip | grep -o '".*"' | sed 's/"//g'`)
+                PATCHLOGFILE=/home/ec2-user/patch_download.out
+                for binary in ${!binaries[@]}
+                do
+                  sleep 1
+                  patch_type="`echo $binary | cut -c1-1 | tr 'a-z' 'A-Z'`" 
+                  echo $patch_type
+                  binary1="`echo $binary | tr 'a-z' 'A-Z'`"
+                  if [ "$patch_type" = "V" ] 
+                  then
+                    if [ "$binary1" = "V982063-01.ZIP" ]; then 
+                    curl https://aws-blogs-artifacts-public.s3.amazonaws.com/artifacts/DBBLOG-3209/oracle-firefox.py -o /home/ec2-user/oracle-firefox.py
+                    vsize=0;
+                    psize=0;
+                    v=1;
+                    echo "$vsize before download"
+                    python3 /home/ec2-user/oracle-firefox.py ${OracleAccountUser} ${OracleAccountPassword} > /home/ec2-user/oracle-firefox.log 
+                    sleep 20
+                    while [ $vsize -eq 0 ]
+                    do  
+                      if [ -f /home/ec2-user/LINUX.X64_193000_db_home.zip ]; then
+                        Installationfile=`sha256sum /home/ec2-user/LINUX.X64_193000_db_home.zip`
+                        vchecksum=`echo $Installationfile | awk {'print $1'} | tr a-z A-Z`
+                        if [ $vchecksum == "BA8329C757133DA313ED3B6D7F86C5AC42CD9970A28BF2E6233F3235233AA8D8" ]; then
+                          mv /home/ec2-user/LINUX.X64_193000_db_home.zip /home/ec2-user/downloaded_patches/V982063-01.zip
+                          vsize=`wc -c /home/ec2-user/downloaded_patches/V982063-01.zip | awk {'print $1'}`
+                          echo "Downloading of Vfile is completed" >> $LOGFILE
+                        else
+                          psize=`wc -c /home/ec2-user/LINUX*.part | awk {'print $1'}` 
+                          echo "Vfile is downloading - $psize - please wait until it fully downloads" >> $LOGFILE
+                          sleep 10
+                          v=$v+1
+                        fi  
+                      else
+                        ps -ef|grep -i firefox | grep -v grep | awk {'print $2'} | xargs kill -9
+                        sleep 10
+                        python3 /home/ec2-user/oracle-firefox.py ${OracleAccountUser} ${OracleAccountPassword} > /home/ec2-user/oracle-firefox.log 
+                        v=$v+1 
+                      fi     
+                    done     
+                    checkzipfile=$(ls /home/ec2-user/downloaded_patches/V982063-01.zip)
+                    if [ -z "$checkzipfile" ]; then
+                      echo "V file doesnt exists in the downloaded folder, do not proceed to create CEV" >> $LOGFILE 
+                      aws s3 cp $LOGFILE  s3://${S3Bucket}
+                      /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --region ${AWS::Region} --resource WaitCondition
+                      continue
+                    fi
+                    fi
+                  else 
+                    echo $binary is "Normal Patch" 
+                    echo "==================================================================================" >> $LOGFILE
+                    echo "Proceeding further to download the Oracle patch $binary from Oracle Website" >> $LOGFILE
+                    echo "==================================================================================" >> $LOGFILE
+                    rm $binary
+                    size=0;
+                    n=1;
+                    echo "$size before download"
+                    while [ $size -eq 0 ]
+                    do  
+                      wget --http-user=${OracleAccountUser} --http-password=${OracleAccountPassword} --no-check-certificate --output-document=/home/ec2-user/downloaded_patches/$binary https://updates.oracle.com/Orion/Download/download_patch/$binary >> "$PATCHLOGFILE" 2>&1
+                      size=`wc -c /home/ec2-user/downloaded_patches/$binary | awk {'print $1'}` 
+                      echo $size after $n download
+                      n=$n+1
+                    done  
+                  fi
+                done
+                Nofilesdownloaded=`ls /home/ec2-user/downloaded_patches/ | wc -l`
+                echo "Number of files downloaded : $Nofilesdownloaded" >> $LOGFILE
+                if [ "$Nofiles" == "$Nofilesdownloaded" ]
+                then
+                  echo "All the oracle patches downloaded successfully" >> $LOGFILE
+                  ls -ltr /home/ec2-user/downloaded_patches/ | awk '{print $9}' | sed '1d' >> /home/ec2-user/${DBVersion}-downloadedpatches.txt
+                  echo "===================================================================================" >> $LOGFILE
+                  echo "Proceeding to validate the checksum for the downloaded patches"  >> $LOGFILE
+                  while read patches
+                  do
+                    sha256sum /home/ec2-user/downloaded_patches/`echo $patches` >> /home/ec2-user/${DBVersion}-downloadedpatcheschecksum.txt
+                  done < /home/ec2-user/${DBVersion}-downloadedpatches.txt
+                  cat /home/ec2-user/${DBVersion}-downloadedpatches.txt | awk -F "p" {'print $2'} | awk -F "_" {'print $1'} >> /home/ec2-user/${DBVersion}-downloadedpatches-trimmed.txt
+                  cat $readme | grep -i zip | sed 1,2d | awk '{print $2}' >> /home/ec2-user/${DBVersion}-actualchecksum.txt
+                  cat /home/ec2-user/${DBVersion}-downloadedpatcheschecksum.txt | awk '{print $1}' | tr a-z A-Z >  /home/ec2-user/${DBVersion}-downloadedpatcheschecksum-v1.txt
+                  size=0;
+                  n=1;
+                  echo "$size before download"
+                  cat /home/ec2-user/${DBVersion}-downloadedpatches.txt | while read patches
+                  do
+                    while [ $size -eq 0 ]
+                    do
+                      trimedpatches=$(echo $patches | awk -F "p" {'print $2'} | awk -F "_" {'print $1'})
+                      echo "Trimed: $trimedpatches"
+                      wget -q --http-user=${OracleAccountUser} --http-password=${OracleAccountPassword} --output-document=/home/ec2-user/$trimedpatches.xml "https://updates.oracle.com/Orion/Services/search?bug=$trimedpatches"
+                      size=`wc -c /home/ec2-user/$trimedpatches.xml | awk {'print $1'}`
+                      n=$n+1
+                      echo "Patchname: $patches"
+                      outputfile=$(grep -wns $patches /home/ec2-user/$trimedpatches.xml -A 2 | grep SHA-256 | awk -F ">" {'print $2'} | awk -F "<" {'print $1'})
+                      echo "OutputChecksum:$outputfile"
+                      echo $outputfile >> /home/ec2-user/${DBVersion}_xmlfilechecksum.txt
+                    done
+                  size=0
+                  done
+                  echo "BA8329C757133DA313ED3B6D7F86C5AC42CD9970A28BF2E6233F3235233AA8D8" >> /home/ec2-user/${DBVersion}_xmlfilechecksum.txt
+                  echo "Checksum Validation is in progress" >> $LOGFILE
+                  file1="/home/ec2-user/${DBVersion}_xmlfilechecksum.txt"
+                  file2="/home/ec2-user/${DBVersion}-downloadedpatcheschecksum-v1.txt"
+                  if [ -n "$(diff -bB "$file1" "$file2")" ]; then
+                    echo "All the downloaded patches checksum is not validated"  >> $LOGFILE
+                    aws s3 cp $LOGFILE  s3://${S3Bucket}
+                    /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --region ${AWS::Region} --resource WaitCondition
+                  else  
+                    echo "Checksum validation is successful for all the downloaded patches from the manifest file" >> $LOGFILE
+                    echo "===================================================================================" >> $LOGFILE
+                    echo "Uploading the downloaded patches to ${S3Bucket}" >> $LOGFILE
+                    if [ -z "${S3bucketPrefix}" ]
+                    then
+                      aws s3 sync /home/ec2-user/downloaded_patches/  s3://${S3Bucket} >> $LOGFILE
+                      patchcheck=$(aws s3 ls s3://${S3Bucket} --recursive |grep "^.* V")
+                    else
+                      aws s3 sync /home/ec2-user/downloaded_patches/  s3://${S3Bucket}/${S3bucketPrefix}/ >> $LOGFILE
+                      patchcheck=$(aws s3 ls s3://${S3Bucket}/${S3bucketPrefix} --recursive |grep "^.* V")
+                    fi    
+                    sleep 100
+                    echo "Successfully uploaded all patches to s3://${S3Bucket}, Now proceeding to create CEV." >> $LOGFILE
+                    /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --region ${AWS::Region} --resource WaitCondition
+                    aws s3 cp $LOGFILE  s3://${S3Bucket}
+                  fi
+                else
+                  echo "Downloading patches are incomplete. CEV Automation has been failed." >> $LOGFILE
+                  aws s3 cp $LOGFILE  s3://${S3Bucket}
+                  /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --region ${AWS::Region} --resource WaitCondition
+                fi
+              fi
+            fi  
+                       
+  WaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    CreationPolicy:
+      ResourceSignal: 
+        Timeout: PT30M
+
+  CustomOracleCEV:
+    DependsOn: WaitCondition
+    DeletionPolicy: Retain
+    Type: AWS::RDS::CustomDBEngineVersion
+    Properties:
+      DatabaseInstallationFilesS3BucketName: !Ref S3Bucket
+      Status: available
+      DatabaseInstallationFilesS3Prefix:
+        Fn::If:
+          - ShouldAddProperty
+          - !Ref S3bucketPrefix
+          - Ref: "AWS::NoValue"
+      Description: CEV for RDS custom for Oracle
+      Engine: !Ref EngineType
+      EngineVersion: !Ref EngineVersion
+      KMSKeyId: !Ref KMSKeyID
+      Manifest: 
+        Fn::If:
+          - CreateEngine1917
+          - '{"mediaImportTemplateVersion":"2020-08-14","databaseInstallationFileNames":["V982063-01.zip"],"opatchFileNames":["p6880880_190000_Linux-x86-64.zip"],"psuRuPatchFileNames": ["p34419443_190000_Linux-x86-64.zip","p34411846_190000_Linux-x86-64.zip"],"otherPatchFileNames": ["p28852325_190000_Linux-x86-64.zip","p29997937_190000_Linux-x86-64.zip","p31335037_190000_Linux-x86-64.zip","p32327201_190000_Linux-x86-64.zip","p33613829_190000_Linux-x86-64.zip","p34006614_190000_Linux-x86-64.zip","p34533061_190000_Linux-x86-64.zip","p34533150_190000_Generic.zip","p28730253_190000_Linux-x86-64.zip","p29213893_1917000DBRU_Generic.zip","p33125873_1917000DBRU_Linux-x86-64.zip","p34446152_1917000DBRU_Linux-x86-64.zip"]}'
+          - Fn::If:
+            - CreateEngine1918
+            - '{"mediaImportTemplateVersion":"2020-08-14","databaseInstallationFileNames":["V982063-01.zip"],"opatchFileNames":["p6880880_190000_Linux-x86-64.zip"],"psuRuPatchFileNames": ["p34765931_190000_Linux-x86-64.zip","p34786990_190000_Linux-x86-64.zip"],"otherPatchFileNames": ["p35099667_190000_Linux-x86-64.zip","p35099674_190000_Generic.zip","p28730253_190000_Linux-x86-64.zip","p29213893_1918000DBRU_Generic.zip","p33125873_1918000DBRU_Linux-x86-64.zip","p35012866_1918000DBRU_Linux-x86-64.zip"]}'    
+            - Fn::If:
+              - CreateEngine1919
+              - '{"mediaImportTemplateVersion":"2020-08-14","databaseInstallationFileNames":["V982063-01.zip"],"opatchFileNames":["p6880880_190000_Linux-x86-64.zip"],"psuRuPatchFileNames": ["p35042068_190000_Linux-x86-64.zip","p35050341_190000_Linux-x86-64.zip"],"otherPatchFileNames": ["p28730253_190000_Linux-x86-64.zip","p29213893_1919000DBRU_Generic.zip","p33125873_1919000DBRU_Linux-x86-64.zip","p35220732_190000_Linux-x86-64.zip","p35239280_190000_Generic.zip"]}'   
+              - Fn::If:
+                - CreateEngine1920
+                - '{"mediaImportTemplateVersion":"2020-08-14","databaseInstallationFileNames":["V982063-01.zip"],"opatchFileNames":["p6880880_190000_Linux-x86-64.zip"],"psuRuPatchFileNames": ["p35320081_190000_Linux-x86-64.zip","p35354406_190000_Linux-x86-64.zip"],"otherPatchFileNames": ["p28730253_1920000DBRU_Linux-x86-64.zip","p29213893_1920000DBRU_Generic.zip","p33125873_1920000DBRU_Linux-x86-64.zip","p35239280_190000_Generic.zip"]}'
+                - Ref: "AWS::NoValue"    
+
+
+  roleClientIDE:
+    Type: "AWS::IAM::Role"
+    DeletionPolicy: Retain
+    Properties:
+      RoleName: !Join ['-', ['RDS-Custom-CEV-Automation-Role', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]]]]
+      Description: "Permits user interaction with AWS APIs from the EC2."
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - "sts:AssumeRole"
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+      Policies:
+        - PolicyName: !Join ['-', ['StackSetExecutionRolePolicy', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]],!Sub "${AWS::Region}"]]
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "iam:GetRole"
+                  - "iam:GetRolePolicy"
+                  - "iam:PassRole"
+                  - "iam:DetachRolePolicy"
+                  - "iam:DeleteRolePolicy"
+                  - "iam:DeleteRole"
+                  - "iam:CreateRole"
+                  - "iam:AttachRolePolicy"
+                  - "iam:PutRolePolicy"
+                  - "ce:*"  
+                Resource:
+                  - "arn:aws:iam::*:role/*"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        - "arn:aws:iam::aws:policy/AWSCloudFormationFullAccess"
+        - !Ref Mediaimportpolicy
+
+  Mediaimportpolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Sid: Allowthemediaimportrdskms
+            Effect: Allow
+            Action:
+              - "mediaimport:CreateDatabaseBinarySnapshot"
+              - "kms:Decrypt"
+              - "kms:GenerateDataKey"
+              - "kms:DescribeKey"
+              - "kms:CreateGrant"
+              - "rds:CreateCustomDBEngineVersion"
+            Resource: "*"
+          - 
+            Sid: AllowS3bucket
+            Effect: Allow
+            Action:
+              - "s3:GetObjectAcl"
+              - "s3:GetObject"
+              - "s3:PutObject"
+              - "s3:PutBucketPolicy"
+              - "s3:CreateBucket"
+              - "s3:GetObjectTagging"
+              - "s3:ListBucket"
+              - "s3:PutBucketObjectLockConfiguration"
+              - "s3:PutBucketVersioning"
+            Resource: 
+              - !Sub arn:aws:s3:::${S3Bucket}/*
+              - !Sub arn:aws:s3:::${S3Bucket}
+              - arn:aws:s3:::do-not-delete-rds-custom-*
+                    
+  profileClientIDE:
+    Type: "AWS::IAM::InstanceProfile"
+    DeletionPolicy: Retain
+    Properties:
+      InstanceProfileName: !Join ['-', ['RDS-Custom-CEV-Automation-Instance-Profile', !Select [4, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]]],!Sub "${AWS::Region}"]]
+      Path: /
+      Roles:
+        - Ref: roleClientIDE              
