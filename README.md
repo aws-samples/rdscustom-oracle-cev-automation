@@ -2,7 +2,7 @@
 
 ## Solution Overview 
 
-We propose a solution to create a CEV by using a CFN template, which helps avoid the above-mentioned problem statement. We provide a CFN template — you just need to download the template and follow the deployment steps to build the CEV. Currently, the template is developed to create the latest 19c version CEV.
+We propose a solution to create a CEV by using a CFN template. We provide a CFN template — you just need to download the template and follow the deployment steps to build the CEV. Currently, the template is developed to create the latest 19c version CEV.
 
 This solution uses the following services and resources:
 
